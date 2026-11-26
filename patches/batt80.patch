@@ -1,130 +1,154 @@
---- a/drivers/power/supply/qcom/smb5-lib.c
-+++ b/drivers/power/supply/qcom/smb5-lib.c
-@@ -2,12 +2,13 @@
- /*
-  * Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
-  * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
-  */
- 
- #include <linux/device.h>
-+#include <linux/module.h>
- #include <linux/regmap.h>
- #include <linux/delay.h>
- #include <linux/power_supply.h>
- #include <linux/regulator/driver.h>
- #include <linux/irq.h>
- #include <linux/iio/consumer.h>
-@@ -2050,12 +2051,66 @@
- 	if (rc < 0)
- 		smblib_err(chg, "Couldn't get capacity prop rc=%d\n", rc);
- 
- 	return rc;
+--- a/drivers/power/supply/qti_battery_charger.c
++++ b/drivers/power/supply/qti_battery_charger.c
+@@ -909,12 +909,14 @@
+ 			}
+ 		}
+ 	}
  }
+ 
+ #define FULL_SOC							10000
++static void batt_limit_check(struct battery_chg_dev *bcdev);
++
+ static void battery_chg_update_prop_work(struct work_struct *work)
+ {
+ 	struct battery_chg_dev *bcdev = container_of(work, struct battery_chg_dev,
+ 						update_prop_work);
+ 	struct psy_state *usb_pst = &bcdev->psy_list[PSY_TYPE_USB];
+ 	struct psy_state *battery_pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
+@@ -925,12 +927,13 @@
+ 	int online = 0;
+ 	int ui_capacity = -1;
+ 	struct timespec ts;
+ 
+ 	read_property_id(bcdev, usb_pst, USB_OEM_CHARGER_TYPE);
+ 	read_property_id(bcdev, battery_pst, BATT_CAPACITY);
++	batt_limit_check(bcdev);
+ 	read_property_id(bcdev, battery_pst, BATT_STATUS);
+ 	read_property_id(bcdev, battery_pst, BATT_CURR_NOW);
+ 
+ 	battery_chg_update_healthd_prop(bcdev);
+ 
+ 	oem_charger_type = usb_pst->prop[USB_OEM_CHARGER_TYPE];
+@@ -2565,12 +2568,81 @@
+ 						battery_class);
+ 
+ 	return scnprintf(buf, PAGE_SIZE, "%d\n", bcdev->ship_mode_en);
+ }
+ static CLASS_ATTR_RW(ship_mode_en);
  
 +/*
 + * Battery charge limit: stop at batt_limit_stop percent, resume 5% below.
-+ * Uses the charger's CHG_DISABLE votable (the same switch as JEITA), so the
-+ * limit is enforced by the charger hardware and survives userspace changes.
++ *
++ * The vendor charger policy re-enables charging from userspace every few
++ * seconds (it writes the class attributes below).  Coerce those enable
++ * paths and re-check on every battery property update so the limit is
++ * enforced by the driver/firmware and cannot be overridden from userspace.
 + */
-+#define BATT_LIMIT_HYSTERESIS	5
-+#define BATT_LIMIT_VOTER	"BATT_LIMIT_VOTER"
-+
 +static int batt_limit_stop = 80;
 +module_param(batt_limit_stop, int, 0644);
 +MODULE_PARM_DESC(batt_limit_stop, "Stop charging at this capacity percentage, 0 disables");
 +
 +static bool batt_limit_active;
 +
-+static void smblib_batt_limit_check(struct smb_charger *chg)
++static int batt_limit_soc(struct battery_chg_dev *bcdev)
 +{
-+	union power_supply_propval val = { 0 };
-+	int stop, resume, rc;
++	int cap;
 +
-+	if (!chg->chg_disable_votable)
++	if (!bcdev)
++		return -1;
++
++	cap = bcdev->psy_list[PSY_TYPE_BATTERY].prop[BATT_CAPACITY];
++	if (cap <= 0)
++		return -1;
++
++	return cap / 100;
++}
++
++static void batt_limit_apply(struct battery_chg_dev *bcdev, bool stop)
++{
++	usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, stop ? 49000 : 0xFFFFFFFF);
++	write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
++			  BATT_FCC_USER, stop ? 0 : 0xFFFFFFFF);
++}
++
++static void batt_limit_check(struct battery_chg_dev *bcdev)
++{
++	int cap, stop = batt_limit_stop;
++
++	if (!bcdev)
 +		return;
 +
-+	stop = batt_limit_stop;
 +	if (stop <= 0 || stop > 100) {
 +		if (batt_limit_active) {
 +			batt_limit_active = false;
-+			vote(chg->chg_disable_votable, BATT_LIMIT_VOTER, false, 0);
++			batt_limit_apply(bcdev, false);
 +			pr_info("batt_limit: disabled, charging released\n");
 +		}
 +		return;
 +	}
-+	resume = stop - BATT_LIMIT_HYSTERESIS;
 +
-+	rc = smblib_get_prop_batt_capacity(chg, &val);
-+	if (rc < 0)
++	cap = batt_limit_soc(bcdev);
++	if (cap < 0)
 +		return;
 +
-+	if (val.intval >= stop) {
++	if (cap >= stop) {
 +		if (!batt_limit_active) {
 +			batt_limit_active = true;
-+			vote(chg->chg_disable_votable, BATT_LIMIT_VOTER, true, 0);
-+			pr_info("batt_limit: %d%%, charging stopped at %d%%\n",
-+				val.intval, stop);
++			batt_limit_apply(bcdev, true);
++			pr_info("batt_limit: %d%%, charging stopped (limit %d%%)\n",
++				cap, stop);
 +		}
-+	} else if (val.intval <= resume) {
-+		if (batt_limit_active) {
-+			batt_limit_active = false;
-+			vote(chg->chg_disable_votable, BATT_LIMIT_VOTER, false, 0);
-+			pr_info("batt_limit: %d%%, charging resumed (stop %d%%)\n",
-+				val.intval, stop);
-+		}
++	} else if (cap <= stop - 5 && batt_limit_active) {
++		batt_limit_active = false;
++		batt_limit_apply(bcdev, false);
++		pr_info("batt_limit: %d%%, charging resumed\n", cap);
 +	}
 +}
 +
- static bool is_charging_paused(struct smb_charger *chg)
+ static ssize_t charging_enabled_store(struct class *c, struct class_attribute *attr,
+ 				const char *buf, size_t count)
  {
- 	int rc;
- 	u8 val;
+ 	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+ 						battery_class);
  
- 	rc = smblib_read(chg, CHARGING_PAUSE_CMD_REG, &val);
-@@ -7434,12 +7489,14 @@
+@@ -2578,13 +2650,17 @@
+ 		return -EINVAL;
+ 	if (bcdev->charging_enabled == 0) {
+ 		/* disable charging*/
+ 		/* ICL below 50mA is same with 0mA, but can differ with other client */
+ 		usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, 49000);
+ 	} else {
+-		usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, 0xFFFFFFFF);
++		if (batt_limit_stop > 0 &&
++		    batt_limit_soc(bcdev) >= batt_limit_stop)
++			usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, 49000);
++		else
++			usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, 0xFFFFFFFF);
  	}
- 
- 	smblib_config_charger_on_debug_battery(chg);
- 
- 	if (chg->batt_psy)
- 		power_supply_changed(chg->batt_psy);
-+
-+	smblib_batt_limit_check(chg);
+ 	pr_info("charging_enabled_store, prop=%d,en=%d\n", USB_INPUT_CURR_LIMIT, bcdev->charging_enabled);
+ 	return count;
  }
- 
- static void pl_update_work(struct work_struct *work)
- {
- 	int val, rc;
- 	struct smb_charger *chg = container_of(work, struct smb_charger,
---- a/drivers/power/supply/qcom/qpnp-smb5.c
-+++ b/drivers/power/supply/qcom/qpnp-smb5.c
-@@ -6,12 +6,13 @@
- #include <linux/debugfs.h>
- #include <linux/delay.h>
- #include <linux/device.h>
- #include <linux/module.h>
- #include <linux/platform_device.h>
- #include <linux/regmap.h>
-+#include <linux/workqueue.h>
- #include <linux/power_supply.h>
- #include <linux/of.h>
- #include <linux/of_device.h>
- #include <linux/of_irq.h>
- #include <linux/log2.h>
- #include <linux/regulator/driver.h>
-@@ -3194,12 +3195,15 @@
- 	rc = smb5_show_charger_status(chip);
- 	if (rc < 0) {
- 		pr_err("Failed in getting charger status rc=%d\n", rc);
- 		goto free_irq;
+ static ssize_t charging_enabled_show(struct class *c, struct class_attribute *attr,
+ 				char *buf)
+@@ -2606,14 +2682,19 @@
+ 		return -EINVAL;
+ 	if (bcdev->battery_charging_enabled == 0) {
+ 		/* disable charging*/
+ 		rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
+ 				BATT_FCC_USER, 0);
+ 	} else {
+-		rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
+-				BATT_FCC_USER, 0xFFFFFFFF);
++		if (batt_limit_stop > 0 &&
++		    batt_limit_soc(bcdev) >= batt_limit_stop)
++			rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
++					BATT_FCC_USER, 0);
++		else
++			rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
++					BATT_FCC_USER, 0xFFFFFFFF);
  	}
+ 	pr_info("battery_charging_enabled_store, prop=%d,en=%d,rc=%d\n", BATT_FCC_USER, bcdev->battery_charging_enabled, rc);
  
-+	/* apply the battery charge limit right after boot */
-+	schedule_work(&chg->bms_update_work);
-+
- 	device_init_wakeup(chg->dev, true);
- 
- 	pr_info("QPNP SMB5 probed successfully\n");
- 
- 	return rc;
- 
+ 	return count;
+ }
+ static ssize_t battery_charging_enabled_show(struct class *c, struct class_attribute *attr,
