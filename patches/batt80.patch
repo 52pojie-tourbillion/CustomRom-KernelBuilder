@@ -1,6 +1,20 @@
 --- a/drivers/power/supply/qcom/smb5-lib.c
 +++ b/drivers/power/supply/qcom/smb5-lib.c
-@@ -2050,12 +2050,66 @@
+@@ -2,12 +2,13 @@
+ /*
+  * Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
+  * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
+ #include <linux/device.h>
++#include <linux/module.h>
+ #include <linux/regmap.h>
+ #include <linux/delay.h>
+ #include <linux/power_supply.h>
+ #include <linux/regulator/driver.h>
+ #include <linux/irq.h>
+ #include <linux/iio/consumer.h>
+@@ -2050,12 +2051,66 @@
  	if (rc < 0)
  		smblib_err(chg, "Couldn't get capacity prop rc=%d\n", rc);
  
@@ -67,7 +81,7 @@
  	u8 val;
  
  	rc = smblib_read(chg, CHARGING_PAUSE_CMD_REG, &val);
-@@ -7434,12 +7488,14 @@
+@@ -7434,12 +7489,14 @@
  	}
  
  	smblib_config_charger_on_debug_battery(chg);
