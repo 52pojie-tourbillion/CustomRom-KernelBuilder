@@ -29,7 +29,38 @@
  	battery_chg_update_healthd_prop(bcdev);
  
  	oem_charger_type = usb_pst->prop[USB_OEM_CHARGER_TYPE];
-@@ -2565,12 +2568,122 @@
+@@ -1455,12 +1458,14 @@
+ 			return power_supply_usb_type_text[i];
+ 	}
+ 
+ 	return "Unknown";
+ }
+ 
++static bool batt_limit_draining;
++
+ static int usb_psy_set_icl(struct battery_chg_dev *bcdev, u32 prop_id, int val)
+ {
+ 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_USB];
+ 	u32 temp;
+ 	int rc;
+ 
+@@ -1473,12 +1478,15 @@
+ 	/*
+ 	 * Input current limit (ICL) can be set by different clients. E.g. USB
+ 	 * driver can request for a current of 500/900 mA depending on the
+ 	 * port type. Also, clients like EUD driver can pass 0 or -22 to
+ 	 * suspend or unsuspend the input for its use case.
+ 	 */
++
++	if (prop_id == USB_INPUT_CURR_LIMIT && batt_limit_draining)
++		val = 49000;
+ 
+ 	temp = val;
+ 	if (val < 0)
+ 		temp = UINT_MAX;
+ 
+ 	rc = write_property_id(bcdev, pst, prop_id, temp);
+@@ -2565,12 +2573,121 @@
  						battery_class);
  
  	return scnprintf(buf, PAGE_SIZE, "%d\n", bcdev->ship_mode_en);
@@ -56,7 +87,6 @@
 +MODULE_PARM_DESC(batt_limit_stop, "Stop charging at this capacity percentage, 0 disables");
 +
 +static bool batt_limit_active;
-+static bool batt_limit_draining;
 +
 +static int batt_limit_soc(struct battery_chg_dev *bcdev)
 +{
@@ -152,7 +182,7 @@
  	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
  						battery_class);
  
-@@ -2578,13 +2691,16 @@
+@@ -2578,13 +2695,16 @@
  		return -EINVAL;
  	if (bcdev->charging_enabled == 0) {
  		/* disable charging*/
@@ -170,7 +200,7 @@
  }
  static ssize_t charging_enabled_show(struct class *c, struct class_attribute *attr,
  				char *buf)
-@@ -2606,14 +2722,18 @@
+@@ -2606,14 +2726,18 @@
  		return -EINVAL;
  	if (bcdev->battery_charging_enabled == 0) {
  		/* disable charging*/
@@ -191,7 +221,7 @@
  	return count;
  }
  static ssize_t battery_charging_enabled_show(struct class *c, struct class_attribute *attr,
-@@ -3329,12 +3449,16 @@
+@@ -3329,12 +3453,16 @@
  			return PTR_ERR(bcdev->typec_class);
  		}
  	}
@@ -208,7 +238,7 @@
  	complete(&bcdev->ack);
  	pmic_glink_unregister_client(bcdev->client);
  	unregister_reboot_notifier(&bcdev->reboot_notifier);
-@@ -3344,12 +3468,13 @@
+@@ -3344,12 +3472,13 @@
  static int battery_chg_remove(struct platform_device *pdev)
  {
  	struct battery_chg_dev *bcdev = platform_get_drvdata(pdev);
