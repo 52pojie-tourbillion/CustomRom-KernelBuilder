@@ -29,7 +29,7 @@
  	battery_chg_update_healthd_prop(bcdev);
  
  	oem_charger_type = usb_pst->prop[USB_OEM_CHARGER_TYPE];
-@@ -2565,12 +2568,106 @@
+@@ -2565,12 +2568,122 @@
  						battery_class);
  
  	return scnprintf(buf, PAGE_SIZE, "%d\n", bcdev->ship_mode_en);
@@ -130,13 +130,29 @@
 +	}
 +}
 +
++static struct delayed_work batt_limit_work;
++static struct battery_chg_dev *batt_limit_dev;
++
++static void batt_limit_work_fn(struct work_struct *work)
++{
++	struct battery_chg_dev *bcdev = batt_limit_dev;
++
++	if (bcdev) {
++		read_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
++				 BATT_CAPACITY);
++		batt_limit_check(bcdev);
++	}
++
++	schedule_delayed_work(&batt_limit_work, msecs_to_jiffies(15000));
++}
++
  static ssize_t charging_enabled_store(struct class *c, struct class_attribute *attr,
  				const char *buf, size_t count)
  {
  	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
  						battery_class);
  
-@@ -2578,13 +2675,16 @@
+@@ -2578,13 +2691,16 @@
  		return -EINVAL;
  	if (bcdev->charging_enabled == 0) {
  		/* disable charging*/
@@ -154,7 +170,7 @@
  }
  static ssize_t charging_enabled_show(struct class *c, struct class_attribute *attr,
  				char *buf)
-@@ -2606,14 +2706,18 @@
+@@ -2606,14 +2722,18 @@
  		return -EINVAL;
  	if (bcdev->battery_charging_enabled == 0) {
  		/* disable charging*/
@@ -175,3 +191,34 @@
  	return count;
  }
  static ssize_t battery_charging_enabled_show(struct class *c, struct class_attribute *attr,
+@@ -3329,12 +3449,16 @@
+ 			return PTR_ERR(bcdev->typec_class);
+ 		}
+ 	}
+ 
+ 	schedule_work(&bcdev->usb_type_work);
+ 
++	batt_limit_dev = bcdev;
++	INIT_DELAYED_WORK(&batt_limit_work, batt_limit_work_fn);
++	schedule_delayed_work(&batt_limit_work, msecs_to_jiffies(5000));
++
+ 	return 0;
+ error:
+ 	bcdev->initialized = false;
+ 	complete(&bcdev->ack);
+ 	pmic_glink_unregister_client(bcdev->client);
+ 	unregister_reboot_notifier(&bcdev->reboot_notifier);
+@@ -3344,12 +3468,13 @@
+ static int battery_chg_remove(struct platform_device *pdev)
+ {
+ 	struct battery_chg_dev *bcdev = platform_get_drvdata(pdev);
+ 	int rc;
+ 
+ 	device_init_wakeup(bcdev->dev, false);
++	cancel_delayed_work_sync(&batt_limit_work);
+ 	debugfs_remove_recursive(bcdev->debugfs_dir);
+ 	class_unregister(&bcdev->battery_class);
+ 	unregister_reboot_notifier(&bcdev->reboot_notifier);
+ 	qti_typec_class_deinit(bcdev->typec_class);
+ 	rc = pmic_glink_unregister_client(bcdev->client);
+ 	if (rc < 0) {
