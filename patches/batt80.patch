@@ -29,7 +29,7 @@
  	battery_chg_update_healthd_prop(bcdev);
  
  	oem_charger_type = usb_pst->prop[USB_OEM_CHARGER_TYPE];
-@@ -2565,12 +2568,81 @@
+@@ -2565,12 +2568,84 @@
  						battery_class);
  
  	return scnprintf(buf, PAGE_SIZE, "%d\n", bcdev->ship_mode_en);
@@ -40,9 +40,13 @@
 + * Battery charge limit: stop at batt_limit_stop percent, resume 5% below.
 + *
 + * The vendor charger policy re-enables charging from userspace every few
-+ * seconds (it writes the class attributes below).  Coerce those enable
-+ * paths and re-check on every battery property update so the limit is
-+ * enforced by the driver/firmware and cannot be overridden from userspace.
++ * seconds (it writes the class attributes below).  Coerce the battery
++ * enable path and re-check on every battery property update so the limit
++ * is enforced by the driver/firmware and cannot be overridden.
++ *
++ * Only the battery charge current (FCC) is zeroed.  The USB input current
++ * is left untouched, so the phone keeps running from the charger while the
++ * battery itself is idle at the limit.
 + */
 +static int batt_limit_stop = 80;
 +module_param(batt_limit_stop, int, 0644);
@@ -66,7 +70,6 @@
 +
 +static void batt_limit_apply(struct battery_chg_dev *bcdev, bool stop)
 +{
-+	usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, stop ? 49000 : 0xFFFFFFFF);
 +	write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
 +			  BATT_FCC_USER, stop ? 0 : 0xFFFFFFFF);
 +}
@@ -111,26 +114,7 @@
  	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
  						battery_class);
  
-@@ -2578,13 +2650,17 @@
- 		return -EINVAL;
- 	if (bcdev->charging_enabled == 0) {
- 		/* disable charging*/
- 		/* ICL below 50mA is same with 0mA, but can differ with other client */
- 		usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, 49000);
- 	} else {
--		usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, 0xFFFFFFFF);
-+		if (batt_limit_stop > 0 &&
-+		    batt_limit_soc(bcdev) >= batt_limit_stop)
-+			usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, 49000);
-+		else
-+			usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, 0xFFFFFFFF);
- 	}
- 	pr_info("charging_enabled_store, prop=%d,en=%d\n", USB_INPUT_CURR_LIMIT, bcdev->charging_enabled);
- 	return count;
- }
- static ssize_t charging_enabled_show(struct class *c, struct class_attribute *attr,
- 				char *buf)
-@@ -2606,14 +2682,19 @@
+@@ -2606,14 +2681,19 @@
  		return -EINVAL;
  	if (bcdev->battery_charging_enabled == 0) {
  		/* disable charging*/
