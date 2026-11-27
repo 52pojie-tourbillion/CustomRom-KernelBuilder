@@ -29,7 +29,7 @@
  	battery_chg_update_healthd_prop(bcdev);
  
  	oem_charger_type = usb_pst->prop[USB_OEM_CHARGER_TYPE];
-@@ -2565,12 +2568,84 @@
+@@ -2565,12 +2568,106 @@
  						battery_class);
  
  	return scnprintf(buf, PAGE_SIZE, "%d\n", bcdev->ship_mode_en);
@@ -37,22 +37,26 @@
  static CLASS_ATTR_RW(ship_mode_en);
  
 +/*
-+ * Battery charge limit: stop at batt_limit_stop percent, resume 5% below.
++ * Battery charge limit (two phase):
++ *   capacity > stop+1 : throttle USB input to 49mA and FCC=0 -> the battery
++ *                       drains down to the limit while the phone keeps
++ *                       running (it is powered from the battery for a while).
++ *   capacity <= stop+1: FCC=0, input normal -> the battery idles at the
++ *                       limit and the phone runs from the charger.  No
++ *                       75-80 cycling.
++ *   capacity <= stop-5: release both -> charge again after real use.
 + *
 + * The vendor charger policy re-enables charging from userspace every few
-+ * seconds (it writes the class attributes below).  Coerce the battery
-+ * enable path and re-check on every battery property update so the limit
-+ * is enforced by the driver/firmware and cannot be overridden.
-+ *
-+ * Only the battery charge current (FCC) is zeroed.  The USB input current
-+ * is left untouched, so the phone keeps running from the charger while the
-+ * battery itself is idle at the limit.
++ * seconds (it writes the class attributes below).  The stores coerce those
++ * writes while the limit is active, so userspace cannot override the limit.
 + */
++#define BATT_LIMIT_HYSTERESIS	5
 +static int batt_limit_stop = 80;
 +module_param(batt_limit_stop, int, 0644);
 +MODULE_PARM_DESC(batt_limit_stop, "Stop charging at this capacity percentage, 0 disables");
 +
 +static bool batt_limit_active;
++static bool batt_limit_draining;
 +
 +static int batt_limit_soc(struct battery_chg_dev *bcdev)
 +{
@@ -68,10 +72,19 @@
 +	return cap / 100;
 +}
 +
-+static void batt_limit_apply(struct battery_chg_dev *bcdev, bool stop)
++static void batt_limit_apply(struct battery_chg_dev *bcdev, bool stop, bool drain)
 +{
++	if (!stop) {
++		usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, 0xFFFFFFFF);
++		write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
++				  BATT_FCC_USER, 0xFFFFFFFF);
++		return;
++	}
++
++	usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT,
++			drain ? 49000 : 0xFFFFFFFF);
 +	write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
-+			  BATT_FCC_USER, stop ? 0 : 0xFFFFFFFF);
++			  BATT_FCC_USER, 0);
 +}
 +
 +static void batt_limit_check(struct battery_chg_dev *bcdev)
@@ -84,7 +97,8 @@
 +	if (stop <= 0 || stop > 100) {
 +		if (batt_limit_active) {
 +			batt_limit_active = false;
-+			batt_limit_apply(bcdev, false);
++			batt_limit_draining = false;
++			batt_limit_apply(bcdev, false, false);
 +			pr_info("batt_limit: disabled, charging released\n");
 +		}
 +		return;
@@ -94,16 +108,24 @@
 +	if (cap < 0)
 +		return;
 +
-+	if (cap >= stop) {
-+		if (!batt_limit_active) {
++	if (cap > stop + 1) {
++		if (!batt_limit_draining) {
 +			batt_limit_active = true;
-+			batt_limit_apply(bcdev, true);
-+			pr_info("batt_limit: %d%%, charging stopped (limit %d%%)\n",
-+				cap, stop);
++			batt_limit_draining = true;
++			batt_limit_apply(bcdev, true, true);
++			pr_info("batt_limit: %d%%, draining to %d%%\n", cap, stop);
 +		}
-+	} else if (cap <= stop - 5 && batt_limit_active) {
++	} else if (cap > stop - BATT_LIMIT_HYSTERESIS) {
++		if (batt_limit_draining || !batt_limit_active) {
++			batt_limit_active = true;
++			batt_limit_draining = false;
++			batt_limit_apply(bcdev, true, false);
++			pr_info("batt_limit: %d%%, holding at %d%%\n", cap, stop);
++		}
++	} else if (batt_limit_active) {
 +		batt_limit_active = false;
-+		batt_limit_apply(bcdev, false);
++		batt_limit_draining = false;
++		batt_limit_apply(bcdev, false, false);
 +		pr_info("batt_limit: %d%%, charging resumed\n", cap);
 +	}
 +}
@@ -114,7 +136,25 @@
  	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
  						battery_class);
  
-@@ -2606,14 +2681,19 @@
+@@ -2578,13 +2675,16 @@
+ 		return -EINVAL;
+ 	if (bcdev->charging_enabled == 0) {
+ 		/* disable charging*/
+ 		/* ICL below 50mA is same with 0mA, but can differ with other client */
+ 		usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, 49000);
+ 	} else {
+-		usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, 0xFFFFFFFF);
++		if (batt_limit_draining)
++			usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, 49000);
++		else
++			usb_psy_set_icl(bcdev, USB_INPUT_CURR_LIMIT, 0xFFFFFFFF);
+ 	}
+ 	pr_info("charging_enabled_store, prop=%d,en=%d\n", USB_INPUT_CURR_LIMIT, bcdev->charging_enabled);
+ 	return count;
+ }
+ static ssize_t charging_enabled_show(struct class *c, struct class_attribute *attr,
+ 				char *buf)
+@@ -2606,14 +2706,18 @@
  		return -EINVAL;
  	if (bcdev->battery_charging_enabled == 0) {
  		/* disable charging*/
@@ -123,8 +163,7 @@
  	} else {
 -		rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
 -				BATT_FCC_USER, 0xFFFFFFFF);
-+		if (batt_limit_stop > 0 &&
-+		    batt_limit_soc(bcdev) >= batt_limit_stop)
++		if (batt_limit_active)
 +			rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_BATTERY],
 +					BATT_FCC_USER, 0);
 +		else
